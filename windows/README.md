@@ -43,6 +43,10 @@ track's peak never cleared the silence floor.
 If a process-tree target exits or restarts under a new PID, the probe stops the
 session and reports `TargetExited`; automatic source reacquisition is deferred.
 
+WAV data is durably checkpointed every ten seconds. A hard process termination
+leaves each track decodable through its last completed checkpoint rather than
+exposing header lengths for PCM that was not synced.
+
 Development from any host: `cargo test` runs the portable WAV crash-tolerance
 harness; `cargo clippy --target x86_64-pc-windows-msvc --all-targets --
 -D warnings` is the cross-compile gate. The implementation plan is

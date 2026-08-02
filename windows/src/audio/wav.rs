@@ -1,10 +1,8 @@
 //! Crash-tolerant WAV writer (plan decision 3).
 //!
-//! Write order per patch interval: append PCM, then rewrite the RIFF and
-//! `data` chunk sizes to cover exactly the bytes already written — so the
-//! declared length never runs ahead of durable data. A kill at any point
-//! loses at most one interval of *declared* audio; samples past the declared
-//! length survive on disk and tools that read to EOF (ffmpeg) recover them.
+//! Checkpoint order: sync appended PCM, persist the RIFF length, then persist
+//! the `data` length. A kill between header writes exposes the previous data
+//! checkpoint, so declared audio never runs ahead of durable PCM.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
@@ -27,6 +25,9 @@ pub struct WavWriter {
     peak: f32,
     patch_interval: Duration,
     last_patch: Instant,
+    finished: bool,
+    #[cfg(test)]
+    crash_stage: Option<CrashStage>,
 }
 
 impl WavWriter {
@@ -41,6 +42,7 @@ impl WavWriter {
     ) -> std::io::Result<Self> {
         let mut file = File::create(path)?;
         file.write_all(&header(sample_rate, 0))?;
+        file.sync_data()?;
         Ok(Self {
             file,
             data_bytes: 0,
@@ -48,6 +50,9 @@ impl WavWriter {
             peak: 0.0,
             patch_interval,
             last_patch: Instant::now(),
+            finished: false,
+            #[cfg(test)]
+            crash_stage: None,
         })
     }
 
@@ -65,33 +70,70 @@ impl WavWriter {
         self.frames += mono.len() as u64;
 
         if self.last_patch.elapsed() >= self.patch_interval {
-            self.patch_header()?;
+            self.checkpoint()?;
             self.last_patch = Instant::now();
         }
         Ok(())
     }
 
-    /// Declare everything appended so far. Data first, sizes second: by the
-    /// time a size is on disk, the bytes it covers already are.
-    fn patch_header(&mut self) -> std::io::Result<()> {
-        let riff_size = (HEADER_LEN - 8 + self.data_bytes) as u32;
-        let data_size = self.data_bytes as u32;
+    /// Durably declare everything appended so far. RIFF length is persisted
+    /// before data length so an interrupted checkpoint exposes only the prior
+    /// complete data checkpoint.
+    fn checkpoint(&mut self) -> std::io::Result<()> {
+        let riff_size = u32::try_from(HEADER_LEN - 8 + self.data_bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "WAV exceeds 4 GiB")
+        })?;
+        let data_size = u32::try_from(self.data_bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "WAV exceeds 4 GiB")
+        })?;
+
+        self.file.sync_data()?;
+        self.abort_if_requested(CrashStage::Pcm);
         self.file.seek(SeekFrom::Start(RIFF_SIZE_OFFSET))?;
         self.file.write_all(&riff_size.to_le_bytes())?;
+        self.file.sync_data()?;
+        self.abort_if_requested(CrashStage::RiffLength);
         self.file.seek(SeekFrom::Start(DATA_SIZE_OFFSET))?;
         self.file.write_all(&data_size.to_le_bytes())?;
+        self.file.sync_data()?;
+        self.abort_if_requested(CrashStage::DataLength);
         self.file.seek(SeekFrom::End(0))?;
         Ok(())
     }
 
     pub fn finish(mut self) -> std::io::Result<TrackStats> {
-        self.patch_header()?;
-        self.file.sync_data()?;
+        self.checkpoint()?;
+        self.finished = true;
         Ok(TrackStats {
             frames_written: self.frames,
             peak_amplitude: self.peak,
         })
     }
+
+    #[cfg(test)]
+    fn abort_if_requested(&self, stage: CrashStage) {
+        if self.crash_stage == Some(stage) {
+            std::process::abort();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn abort_if_requested(&self, _stage: CrashStage) {}
+}
+
+impl Drop for WavWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.checkpoint();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrashStage {
+    Pcm,
+    RiffLength,
+    DataLength,
 }
 
 fn header(sample_rate: u32, data_bytes: u32) -> [u8; HEADER_LEN as usize] {
@@ -115,13 +157,13 @@ fn header(sample_rate: u32, data_bytes: u32) -> [u8; HEADER_LEN as usize] {
 
 #[cfg(test)]
 mod tests {
-    //! Truncation harness: a kill is simulated by snapshotting the file
-    //! bytes at each point in the append → patch cycle — writes are visible
-    //! to other readers the moment `write_all` returns, so the on-disk state
-    //! mid-cycle *is* the state a kill would leave.
+    //! Truncation harness: an ignored helper test is launched in a subprocess
+    //! and aborts at each durability boundary. The parent then opens the
+    //! checkpoint with a real WAV decoder.
 
     use super::*;
     use std::io::Read;
+    use std::process::Command;
 
     struct Parsed {
         declared_data: u32,
@@ -149,7 +191,7 @@ mod tests {
             p.declared_data,
             p.durable_data
         );
-        assert_eq!(p.declared_riff, 36 + p.declared_data);
+        assert!(p.declared_riff >= 36 + p.declared_data);
     }
 
     fn snapshot(path: &Path) -> Vec<u8> {
@@ -172,24 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn kill_between_append_and_patch() {
-        let path = tmp("mid-cycle.wav");
-        // Interval an hour out: appends land, no patch ever runs.
-        let mut w =
-            WavWriter::with_patch_interval(&path, 48_000, Duration::from_secs(3600)).unwrap();
-        w.write_samples(&[1000i16; 4800]).unwrap();
-        w.write_samples(&[-2000i16; 4800]).unwrap();
-
-        let bytes = snapshot(&path);
-        assert_invariant(&bytes);
-        let p = parse(&bytes);
-        // Undeclared but durable: recoverable by EOF-reading tools.
-        assert_eq!(p.declared_data, 0);
-        assert_eq!(p.durable_data, 2 * 4800 * 2);
-        std::mem::forget(w); // the simulated kill: no drop, no finish
-    }
-
-    #[test]
     fn kill_after_patch() {
         let path = tmp("post-patch.wav");
         let mut w = WavWriter::with_patch_interval(&path, 48_000, Duration::ZERO).unwrap();
@@ -198,7 +222,7 @@ mod tests {
         let bytes = snapshot(&path);
         assert_invariant(&bytes);
         assert_eq!(parse(&bytes).declared_data, 4800 * 2);
-        std::mem::forget(w);
+        drop(w);
     }
 
     #[test]
@@ -229,5 +253,51 @@ mod tests {
             assert!(p.declared_data >= last_declared);
             last_declared = p.declared_data;
         }
+    }
+
+    #[test]
+    fn aborted_checkpoint_remains_decodable_at_every_boundary() {
+        for (stage, expected_samples) in [
+            ("data-synced", 480usize),
+            ("riff-synced", 480),
+            ("data-size-synced", 960),
+        ] {
+            let path = tmp(&format!("abort-{stage}.wav"));
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "audio::wav::tests::checkpoint_abort_helper",
+                    "--ignored",
+                ])
+                .env("QUILL_WAV_CRASH_STAGE", stage)
+                .env("QUILL_WAV_CRASH_PATH", &path)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "helper did not abort at {stage}");
+
+            let bytes = snapshot(&path);
+            assert_invariant(&bytes);
+            let mut reader = hound::WavReader::open(&path).unwrap();
+            assert_eq!(reader.spec().sample_rate, 48_000);
+            let samples: Result<Vec<i16>, _> = reader.samples::<i16>().collect();
+            assert_eq!(samples.unwrap().len(), expected_samples);
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for aborted_checkpoint_remains_decodable_at_every_boundary"]
+    fn checkpoint_abort_helper() {
+        let stage = match std::env::var("QUILL_WAV_CRASH_STAGE").unwrap().as_str() {
+            "data-synced" => CrashStage::Pcm,
+            "riff-synced" => CrashStage::RiffLength,
+            "data-size-synced" => CrashStage::DataLength,
+            other => panic!("unknown crash stage: {other}"),
+        };
+        let path = std::path::PathBuf::from(std::env::var_os("QUILL_WAV_CRASH_PATH").unwrap());
+        let mut writer = WavWriter::with_patch_interval(&path, 48_000, Duration::ZERO).unwrap();
+        writer.write_samples(&[1000i16; 480]).unwrap();
+        writer.crash_stage = Some(stage);
+        writer.write_samples(&[-2000i16; 480]).unwrap();
+        panic!("checkpoint did not abort");
     }
 }
