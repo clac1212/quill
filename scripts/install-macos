@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(dirname -- "$script_dir")
+install_dir=${QUILL_INSTALL_DIR:-/usr/local/bin}
+binary="$repo_root/macos/.build/release/quill"
+
+if [ ! -x "$binary" ]; then
+    printf 'release binary not found; run ./scripts/build-macos first\n' >&2
+    exit 1
+fi
+
+install -d "$install_dir"
+install -m 755 "$binary" "$install_dir/quill"
+
+printf 'installed quill to %s/quill\n' "$install_dir"
