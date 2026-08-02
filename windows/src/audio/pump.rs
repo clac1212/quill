@@ -5,16 +5,17 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT,
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+use windows::Win32::Media::Audio::{IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT};
+use windows::Win32::System::Threading::{
+    CreateEventW, OpenProcess, WaitForMultipleObjects, WaitForSingleObject, PROCESS_SYNCHRONIZE,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::audio::wav::WavWriter;
-use crate::audio::{CaptureError, TrackStats};
+use crate::audio::{CaptureError, Pid, TrackStats};
 
 pub(crate) const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const WAIT_SLICE_MS: u32 = 200;
@@ -68,29 +69,113 @@ impl Drop for EventHandle {
     }
 }
 
-/// Run until `shared.stop`: wait on the client's event, drain every pending
-/// packet, downmix, append. Returns the final stats after a last drain and
-/// the writer's closing header patch.
-pub(crate) fn run(
-    client: &IAudioClient,
-    capture: &IAudioCaptureClient,
-    event: &EventHandle,
-    channels: u16,
-    out: &Path,
-    shared: &Shared,
-) -> Result<TrackStats, CaptureError> {
-    let mut writer = WavWriter::create(out, OUTPUT_SAMPLE_RATE)?;
-    unsafe { client.Start() }.map_err(CaptureError::at("IAudioClient::Start"))?;
+/// Synchronization handle for detecting termination of a loopback target.
+pub(crate) struct ProcessMonitor {
+    handle: HANDLE,
+    pid: Pid,
+}
 
-    let mut mono: Vec<i16> = Vec::new();
-    while !shared.stop.load(Ordering::Acquire) {
-        unsafe { WaitForSingleObject(event.raw(), WAIT_SLICE_MS) };
-        drain(capture, channels, &mut mono, &mut writer, shared)?;
+impl ProcessMonitor {
+    pub(crate) fn open(pid: Pid) -> Result<Self, CaptureError> {
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid.get()) }
+            .map_err(CaptureError::at("OpenProcess(target)"))?;
+        Ok(Self { handle, pid })
+    }
+}
+
+impl Drop for ProcessMonitor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Borrowed inputs for one capture worker.
+pub(crate) struct CapturePump<'a> {
+    client: &'a IAudioClient,
+    capture: &'a IAudioCaptureClient,
+    event: &'a EventHandle,
+    channels: u16,
+    out: &'a Path,
+    shared: &'a Shared,
+    target: Option<&'a ProcessMonitor>,
+}
+
+impl<'a> CapturePump<'a> {
+    pub(crate) fn new(
+        client: &'a IAudioClient,
+        capture: &'a IAudioCaptureClient,
+        event: &'a EventHandle,
+        channels: u16,
+        out: &'a Path,
+        shared: &'a Shared,
+        target: Option<&'a ProcessMonitor>,
+    ) -> Self {
+        Self {
+            client,
+            capture,
+            event,
+            channels,
+            out,
+            shared,
+            target,
+        }
     }
 
-    let _ = unsafe { client.Stop() };
-    drain(capture, channels, &mut mono, &mut writer, shared)?;
-    writer.finish().map_err(Into::into)
+    /// Run until stopped: drain each event, downmix, and append to WAV.
+    pub(crate) fn run(self, ready: mpsc::Sender<()>) -> Result<TrackStats, CaptureError> {
+        let mut writer = WavWriter::create(self.out, OUTPUT_SAMPLE_RATE)?;
+        unsafe { self.client.Start() }.map_err(CaptureError::at("IAudioClient::Start"))?;
+        let _ = ready.send(());
+
+        let mut mono: Vec<i16> = Vec::new();
+        while !self.shared.stop.load(Ordering::Acquire) {
+            wait_for_audio_or_exit(self.event, self.target)?;
+            drain(
+                self.capture,
+                self.channels,
+                &mut mono,
+                &mut writer,
+                self.shared,
+            )?;
+        }
+
+        let _ = unsafe { self.client.Stop() };
+        drain(
+            self.capture,
+            self.channels,
+            &mut mono,
+            &mut writer,
+            self.shared,
+        )?;
+        writer.finish().map_err(Into::into)
+    }
+}
+
+fn wait_for_audio_or_exit(
+    event: &EventHandle,
+    target: Option<&ProcessMonitor>,
+) -> Result<(), CaptureError> {
+    let result = match target {
+        Some(target) => unsafe {
+            WaitForMultipleObjects(&[event.raw(), target.handle], false, WAIT_SLICE_MS)
+        },
+        None => unsafe { WaitForSingleObject(event.raw(), WAIT_SLICE_MS) },
+    };
+    if result == WAIT_FAILED {
+        let error = windows::core::Error::from_thread();
+        return Err(CaptureError::Activation {
+            hr: error.code(),
+            stage: "capture event wait",
+        });
+    }
+    if let Some(target) = target {
+        if result.0 == WAIT_OBJECT_0.0 + 1 {
+            return Err(CaptureError::TargetExited(target.pid));
+        }
+    }
+    Ok(())
 }
 
 fn drain(
@@ -122,10 +207,7 @@ fn drain(
         }
         .map_err(CaptureError::at("GetBuffer"))?;
 
-        if frames > 0
-            && qpc_position != 0
-            && shared.first_buffer_qpc.load(Ordering::Relaxed) == 0
-        {
+        if frames > 0 && qpc_position != 0 && shared.first_buffer_qpc.load(Ordering::Relaxed) == 0 {
             shared
                 .first_buffer_qpc
                 .store(qpc_position as i64, Ordering::Release);

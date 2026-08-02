@@ -15,7 +15,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::CLSCTX_ALL;
 
 use crate::audio::com::ComGuard;
-use crate::audio::pump::{self, EventHandle, Shared};
+use crate::audio::pump::{CapturePump, EventHandle, Shared};
 use crate::audio::{device, CaptureError, QpcInstant, TrackRecorder, TrackStats};
 
 const BUFFER_DURATION_HNS: i64 = 2_000_000; // 200 ms
@@ -44,33 +44,27 @@ impl TrackRecorder for MicRecorder {
     fn start(&mut self, out: &Path) -> Result<(), CaptureError> {
         let out: PathBuf = out.to_owned();
         let shared = self.shared.clone_refs();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), ()>>();
+        let (ready_tx, ready_rx) = mpsc::channel();
 
         let worker = std::thread::Builder::new()
             .name("quill-mic".into())
             .spawn(move || {
                 let _com = match ComGuard::init() {
                     Ok(g) => g,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(()));
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 };
                 let (client, capture, event, channels) = match activate() {
                     Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(()));
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 };
-                let _ = ready_tx.send(Ok(()));
-                pump::run(&client, &capture, &event, channels, &out, &shared)
+                CapturePump::new(&client, &capture, &event, channels, &out, &shared, None)
+                    .run(ready_tx)
             })
             .map_err(CaptureError::Io)?;
         self.worker = Some(worker);
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(()),
+            Ok(()) => Ok(()),
             _ => Err(self.stop().expect_err("worker signalled failure")),
         }
     }
@@ -92,6 +86,10 @@ impl TrackRecorder for MicRecorder {
     fn first_buffer_at(&self) -> Option<QpcInstant> {
         let qpc = self.shared.first_buffer_qpc.load(Ordering::Acquire);
         (qpc != 0).then_some(QpcInstant(qpc))
+    }
+
+    fn has_stopped(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
     }
 }
 
@@ -119,7 +117,7 @@ fn activate() -> Result<CaptureCtx, CaptureError> {
 
     let event = EventHandle::new()?;
     unsafe { client.SetEventHandle(event.raw()) }.map_err(CaptureError::at("SetEventHandle"))?;
-    let capture: IAudioCaptureClient =
-        unsafe { client.GetService() }.map_err(CaptureError::at("GetService(IAudioCaptureClient)"))?;
+    let capture: IAudioCaptureClient = unsafe { client.GetService() }
+        .map_err(CaptureError::at("GetService(IAudioCaptureClient)"))?;
     Ok((client, capture, event, format.nChannels))
 }

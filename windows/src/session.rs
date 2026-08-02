@@ -87,6 +87,11 @@ impl RecordingSession {
         &self.dir
     }
 
+    /// Whether either capture worker ended before an explicit session stop.
+    pub fn capture_has_stopped(&self) -> bool {
+        self.mic.has_stopped() || self.system.has_stopped()
+    }
+
     /// Stop both tracks and write meta.json. Both stops always run; the
     /// first error surfaces after cleanup.
     pub fn stop(mut self) -> Result<SessionSummary, CaptureError> {

@@ -2,10 +2,10 @@
 //! raw process list, deduped so a multi-process app (Teams, browsers) shows
 //! as one row keyed by its top-level parent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use windows::core::Interface;
-use windows::Win32::Foundation::CloseHandle;
+use windows::core::{Interface, BOOL};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
 use windows::Win32::Media::Audio::{
     eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
 };
@@ -13,19 +13,19 @@ use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+};
 
+use crate::audio::process_tree::{capture_root, ProcInfo};
 use crate::audio::{device, CaptureError, CaptureTarget, Pid};
-
-struct ProcInfo {
-    name: String,
-    parent: u32,
-}
 
 /// Enumerate processes with render sessions across every active render
 /// endpoint (a session on a non-default device still counts), then collapse
 /// each to the topmost ancestor with the same executable name.
 pub fn capture_targets() -> Result<Vec<CaptureTarget>, CaptureError> {
     let procs = process_snapshot()?;
+    let window_pids = visible_window_pids()?;
     let mut session_pids: HashMap<u32, bool> = HashMap::new();
 
     for endpoint in device::active_endpoints(eRender)? {
@@ -60,13 +60,15 @@ pub fn capture_targets() -> Result<Vec<CaptureTarget>, CaptureError> {
         let Some(info) = procs.get(&pid) else {
             continue; // exited between session scan and snapshot
         };
-        let top = top_level_ancestor(pid, &info.name, &procs);
+        let top = capture_root(pid, &procs, &window_pids);
         let Some(top_pid) = Pid::new(top) else {
             continue;
         };
         let entry = by_top.entry(top).or_insert_with(|| CaptureTarget {
             pid: top_pid,
-            name: procs.get(&top).map_or_else(|| info.name.clone(), |p| p.name.clone()),
+            name: procs
+                .get(&top)
+                .map_or_else(|| info.name.clone(), |p| p.name.clone()),
             session_active: false,
         });
         entry.session_active |= active;
@@ -75,23 +77,6 @@ pub fn capture_targets() -> Result<Vec<CaptureTarget>, CaptureError> {
     let mut targets: Vec<CaptureTarget> = by_top.into_values().collect();
     targets.sort_by_key(|t| t.name.to_lowercase());
     Ok(targets)
-}
-
-/// Climb the parent chain while the parent is alive and runs the same
-/// executable — Teams' renderer children collapse into ms-teams.exe. Depth
-/// bound guards against ppid cycles from pid reuse.
-fn top_level_ancestor(pid: u32, name: &str, procs: &HashMap<u32, ProcInfo>) -> u32 {
-    let mut current = pid;
-    for _ in 0..32 {
-        let Some(info) = procs.get(&current) else {
-            break;
-        };
-        match procs.get(&info.parent) {
-            Some(parent) if parent.name.eq_ignore_ascii_case(name) => current = info.parent,
-            _ => break,
-        }
-    }
-    current
 }
 
 fn process_snapshot() -> Result<HashMap<u32, ProcInfo>, CaptureError> {
@@ -125,4 +110,33 @@ fn process_snapshot() -> Result<HashMap<u32, ProcInfo>, CaptureError> {
         let _ = CloseHandle(snapshot);
     }
     Ok(procs)
+}
+
+fn visible_window_pids() -> Result<HashSet<u32>, CaptureError> {
+    let mut pids = HashSet::new();
+    // SAFETY: EnumWindows invokes the callback synchronously. `pids` remains
+    // alive and exclusively borrowed for the full call, and the callback casts
+    // the LPARAM back to its original `HashSet<u32>` type.
+    unsafe {
+        EnumWindows(
+            Some(collect_visible_window_pid),
+            LPARAM((&raw mut pids).cast::<core::ffi::c_void>() as isize),
+        )
+    }
+    .map_err(CaptureError::at("EnumWindows"))?;
+    Ok(pids)
+}
+
+unsafe extern "system" fn collect_visible_window_pid(hwnd: HWND, state: LPARAM) -> BOOL {
+    // SAFETY: `state` is created by `visible_window_pids` from a live,
+    // exclusively borrowed HashSet and EnumWindows does not retain it.
+    let pids = unsafe { &mut *(state.0 as *mut HashSet<u32>) };
+    if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+        if pid != 0 {
+            pids.insert(pid);
+        }
+    }
+    BOOL(1)
 }

@@ -15,6 +15,8 @@ pub mod loopback;
 pub mod mic;
 #[cfg(windows)]
 pub mod process;
+#[cfg(any(windows, test))]
+mod process_tree;
 #[cfg(windows)]
 mod pump;
 
@@ -143,7 +145,10 @@ impl From<std::io::Error> for CaptureError {
 impl CaptureError {
     /// Wrap a COM failure with the activation stage it happened at.
     pub(crate) fn at(stage: &'static str) -> impl FnOnce(windows::core::Error) -> Self {
-        move |e| Self::Activation { hr: e.code(), stage }
+        move |e| Self::Activation {
+            hr: e.code(),
+            stage,
+        }
     }
 }
 
@@ -162,4 +167,7 @@ pub trait TrackRecorder: Send {
     /// QPC stamp of the first delivered buffer; `None` if no audio ever
     /// arrived. `start_offset_ms` derives from deltas between these.
     fn first_buffer_at(&self) -> Option<QpcInstant>;
+
+    /// Whether the worker ended before the session requested a stop.
+    fn has_stopped(&self) -> bool;
 }

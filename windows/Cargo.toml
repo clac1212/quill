@@ -1,6 +1,6 @@
 [package]
 name = "quill"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Fully local meeting recorder and transcriber — Windows implementation"
@@ -44,6 +44,7 @@ features = [
     "Win32_System_Performance",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
 ]
