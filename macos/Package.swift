@@ -28,5 +28,9 @@ let package = Package(
                 ]),
             ]
         ),
+        .testTarget(
+            name: "QuillTests",
+            dependencies: ["quill"]
+        ),
     ]
 )

@@ -40,12 +40,15 @@ actor TranscriptionCoordinator {
     /// oldest-first is a name sort.
     func resumePending(root: URL) {
         guard Config.transcriptionEnabled() else { return }
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: nil
-        ) else { return }
+        guard
+            let entries = try? FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: nil
+            )
+        else { return }
 
         let fm = FileManager.default
-        let pending = entries
+        let pending =
+            entries
             .filter {
                 fm.fileExists(atPath: $0.appendingPathComponent("meta.json").path)
                     && !fm.fileExists(atPath: $0.appendingPathComponent("transcript.json").path)
@@ -55,9 +58,10 @@ actor TranscriptionCoordinator {
             queue.append(dir)
         }
         if !pending.isEmpty {
-            FileHandle.standardError.write(Data(
-                "resuming \(pending.count) untranscribed session(s)\n".utf8
-            ))
+            FileHandle.standardError.write(
+                Data(
+                    "resuming \(pending.count) untranscribed session(s)\n".utf8
+                ))
         }
         drainIfIdle()
     }
@@ -98,35 +102,31 @@ actor TranscriptionCoordinator {
     }
 
     private func transcribe(_ dir: URL) async throws {
-        let meta = try SessionMeta.read(from: dir)
+        // Both metadata schemas normalize to ordered (file, speaker, offset)
+        // inputs — one per segment under v2, one per track under v1. Each
+        // segment transcribes independently and shifts onto the session
+        // clock, so timing gaps around a capture recovery stay visible.
+        let (inputs, captureStatus) = try SessionMeta.readInputs(from: dir)
         let engine = try await preparedEngine()
 
         var merged: [Transcript.Segment] = []
-        for track in meta.tracks {
-            let audio = dir.appendingPathComponent(track.file)
+        for input in inputs {
+            let audio = dir.appendingPathComponent(input.file)
             guard FileManager.default.fileExists(atPath: audio.path) else {
-                log(dir, "skipping missing track \(track.file)")
+                log(dir, "skipping missing segment \(input.file)")
                 continue
             }
-            log(dir, "transcribing \(track.file) (\(engine.name))")
-            // One bad track (empty, truncated) shouldn't cost us the other's
-            // transcript — log it and keep going.
+            log(dir, "transcribing \(input.file) (\(engine.name))")
+            // One bad segment (empty, truncated) shouldn't cost us the rest —
+            // log it and keep going.
             let segments: [TranscriptSegment]
             do {
                 segments = try await engine.transcribe(audio)
             } catch {
-                log(dir, "skipping \(track.file): \(error)")
+                log(dir, "skipping \(input.file): \(error)")
                 continue
             }
-            let offset = TimeInterval(track.offsetMs) / 1000
-            merged += segments.map {
-                Transcript.Segment(
-                    speaker: track.speaker,
-                    start_ms: Int(($0.start + offset) * 1000),
-                    end_ms: Int(($0.end + offset) * 1000),
-                    text: $0.text
-                )
-            }
+            merged += Transcript.shifted(segments, speaker: input.speaker, offsetMs: input.offsetMs)
         }
         merged.sort { $0.start_ms < $1.start_ms }
 
@@ -136,7 +136,7 @@ actor TranscriptionCoordinator {
             created_at: ISO8601DateFormatter().string(from: Date()),
             segments: merged
         )
-        try transcript.write(to: dir)
+        try transcript.write(to: dir, captureStatus: captureStatus)
         log(dir, "done — \(merged.count) segments")
     }
 
@@ -144,9 +144,10 @@ actor TranscriptionCoordinator {
         if let engine { return engine }
         let configured = Config.transcriptionEngine()
         if configured != "parakeet" {
-            FileHandle.standardError.write(Data(
-                "warning: unknown transcription engine \"\(configured)\" — using parakeet\n".utf8
-            ))
+            FileHandle.standardError.write(
+                Data(
+                    "warning: unknown transcription engine \"\(configured)\" — using parakeet\n".utf8
+                ))
         }
         let engine = ParakeetEngine()
         try await engine.prepare()
@@ -186,53 +187,11 @@ actor TranscriptionCoordinator {
     }
 }
 
-/// The slice of meta.json the coordinator needs: which files exist, who they
-/// represent, and how far each track started after the earliest one.
-private struct SessionMeta {
-    struct Track {
-        let file: String
-        let speaker: String
-        let offsetMs: Int
-    }
-
-    let tracks: [Track]
-
-    enum MetaError: Error, CustomStringConvertible {
-        case unreadable(URL)
-
-        var description: String {
-            switch self {
-            case .unreadable(let url): return "can't parse \(url.path)"
-            }
-        }
-    }
-
-    static func read(from dir: URL) throws -> SessionMeta {
-        let url = dir.appendingPathComponent("meta.json")
-        guard
-            let data = try? Data(contentsOf: url),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let files = json["files"] as? [String: String]
-        else { throw MetaError.unreadable(url) }
-
-        // Sessions recorded before offsets were captured default to 0 —
-        // tracks start within tens of milliseconds of each other anyway.
-        let offsets = json["start_offset_ms"] as? [String: Int] ?? [:]
-        var tracks: [Track] = []
-        if let mic = files["mic"] {
-            tracks.append(Track(file: mic, speaker: "me", offsetMs: offsets["mic"] ?? 0))
-        }
-        if let system = files["system"] {
-            tracks.append(Track(file: system, speaker: "them", offsetMs: offsets["system"] ?? 0))
-        }
-        return SessionMeta(tracks: tracks)
-    }
-}
-
 /// Canonical transcript. Property names are the JSON schema — this struct
-/// exists to be serialized.
-private struct Transcript: Codable {
-    struct Segment: Codable {
+/// exists to be serialized. Internal (not private) so the offset-preserving
+/// merge math is unit-testable.
+struct Transcript: Codable {
+    struct Segment: Codable, Equatable {
         let speaker: String
         let start_ms: Int
         let end_ms: Int
@@ -244,20 +203,43 @@ private struct Transcript: Codable {
     let created_at: String
     let segments: [Segment]
 
+    /// Shift one audio file's transcript segments onto the session clock by
+    /// the file's start offset. Segments are never collapsed against a
+    /// previous file's end — a capture gap stays visible as a timestamp gap.
+    static func shifted(
+        _ segments: [TranscriptSegment], speaker: String, offsetMs: Int
+    ) -> [Segment] {
+        segments.map {
+            Segment(
+                speaker: speaker,
+                start_ms: Int($0.start * 1000) + offsetMs,
+                end_ms: Int($0.end * 1000) + offsetMs,
+                text: $0.text
+            )
+        }
+    }
+
     /// Write transcript.json and render transcript.md. Both writes are atomic
     /// (temp file + rename), so a partially written transcript never exists on
     /// disk — resumePending treats presence of transcript.json as "done".
-    func write(to dir: URL) throws {
+    /// `captureStatus` (v2 sessions only) is persisted in the readable header
+    /// so an incomplete recording stays visibly incomplete after the
+    /// transient notification disappears.
+    func write(to dir: URL, captureStatus: TrackStatus? = nil) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(self)
             .write(to: dir.appendingPathComponent("transcript.json"), options: .atomic)
-        try Data(rendered(title: dir.lastPathComponent).utf8)
+        try Data(rendered(title: dir.lastPathComponent, captureStatus: captureStatus).utf8)
             .write(to: dir.appendingPathComponent("transcript.md"), options: .atomic)
     }
 
-    private func rendered(title: String) -> String {
-        var lines = ["# \(title)", "", "engine: \(engine) (\(model))", ""]
+    func rendered(title: String, captureStatus: TrackStatus? = nil) -> String {
+        var lines = ["# \(title)", "", "engine: \(engine) (\(model))"]
+        if let captureStatus, captureStatus != .complete {
+            lines.append("capture: \(captureStatus.rawValue)")
+        }
+        lines.append("")
         for seg in segments {
             lines.append("**[\(Self.clock(seg.start_ms))] \(seg.speaker):** \(seg.text)")
             lines.append("")
@@ -267,7 +249,9 @@ private struct Transcript: Codable {
 
     private static func clock(_ ms: Int) -> String {
         let total = ms / 1000
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
         return h > 0
             ? String(format: "%d:%02d:%02d", h, m, s)
             : String(format: "%d:%02d", m, s)

@@ -1,7 +1,7 @@
 ---
 title: "macOS audio-route change silently truncates mic capture"
 date: 2026-08-03
-status: open
+status: resolved
 affects: "macOS microphone capture and recording completeness"
 ---
 
@@ -54,6 +54,14 @@ does not establish whether the process tap was invalidated by the same route
 change because that track contained long silent intervals before the mic
 cutoff. System-track route recovery should therefore be addressed alongside
 the mic fix, but kept as a separately measurable behavior.
+
+> **Resolved 2026.08.04** — implemented per `.plan/macos-route-recovery.md`
+> (released as 0.1.3): capture-health state machines and telemetry
+> (`macos/Sources/quill/Audio/CaptureHealth.swift`), route observation and
+> segmented restart in both recorders, watchdog/recovery orchestration in
+> `RecordingSession`, metadata schema v2 with a v1-compatible reader, and
+> user-visible recovering/degraded/incomplete states. Automated suite passes;
+> the hardware route matrix in bug-001 remains to be run.
 
 ## Proposed fix
 

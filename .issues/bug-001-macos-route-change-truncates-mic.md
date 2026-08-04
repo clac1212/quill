@@ -1,6 +1,6 @@
 # Bug Report :: macOS audio-route change truncates an active mic recording
 
-Last updated: `2026.08.03`
+Last updated: `2026.08.04`
 
 > A 36:40 macOS session appeared to keep recording, but the mic file stopped
 > receiving audio at 28:08 after an AirPods device-route event. Quill emitted
@@ -10,7 +10,7 @@ Last updated: `2026.08.03`
 |---|---|
 | **Project** | quill |
 | **Severity** | degraded |
-| **Status** | investigating |
+| **Status** | fixed — automated verification passed; hardware route matrix pending |
 | **Affects** | macOS microphone capture, recording liveness, transcript completeness |
 
 ---
@@ -117,3 +117,29 @@ track, so its exact failure mechanism is not established by this incident.
 - Earlier 38:10 and 27:44 sessions completed without the same truncation.
 - This incident does not implicate the transcription engine; the source mic
   file itself ends at the transcript endpoint.
+
+---
+
+## 8. Resolution
+
+Fixed in 0.1.3 per the plan in `.plan/macos-route-recovery.md` (mechanism in
+[rca-006](rca-006-macos-route-change-truncates-mic.md)). Both recorders now
+report callback telemetry and route-change events; `RecordingSession` runs a
+one-second watchdog that restarts a stalled track on the current route into a
+new numbered segment, preserving all audio already written. Metadata v2
+records segments, interruptions, and a `complete`/`recovered`/`incomplete`
+status; the menu bar, notifications, and transcript header surface recovery
+and loss instead of displaying a healthy recording.
+
+Verification evidence:
+
+- `swift format lint --strict`, `swift build -c release`, and `swift test`
+  pass — 32 deterministic tests covering the health state machine (stall
+  detection, route-event debounce, retry schedule, degradation), recovery
+  orchestration with fake recorders (single rotation, stop-during-retry
+  creating no post-stop segment, startup rollback), metadata v1/v2
+  compatibility, and offset-preserving transcript merges.
+- The manual hardware route matrix (AirPods connect/disconnect, default-device
+  switches, rapid churn, 45-minute control run) defined in the plan's
+  Verification section has not yet been executed; the bug closes fully once it
+  has.

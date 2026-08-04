@@ -45,7 +45,8 @@ Each session lands in `~/Recordings/<yyyy.MM.dd-HHmm>/`:
 |---|---|
 | `mic.caf` | your side (default input device, AAC) |
 | `system.caf` | everything the Mac played — the other side of the call (AAC) |
-| `meta.json` | start/end timestamps, duration, per-track start offsets |
+| `mic-002.caf`, `system-002.caf`, … | additional segments, present only if capture had to restart mid-session (see below) |
+| `meta.json` | start/end timestamps, duration, per-track segments/offsets, and capture status (`complete`/`recovered`/`incomplete`) |
 | `transcript.json` | canonical transcript — engine provenance + timed, speaker-tagged segments |
 | `transcript.md` | the same transcript rendered for reading |
 | `transcribe.log` | transcription progress/errors for this session |
@@ -55,6 +56,37 @@ and mic-vs-system is free two-party diarization — `me` vs `them` with no
 speaker-identification model. CAF on purpose: unlike m4a, it needs no
 finalization pass — if the process dies mid-meeting, everything already
 written is still readable.
+
+## Capture recovery
+
+macOS audio routes are not stable for the length of a meeting — connecting or
+disconnecting AirPods, or changing the default device, can silently stop a
+capture stream. Quill watches both tracks (a one-second watchdog over callback
+progress, plus route-change notifications) and, if a track stalls, restarts it
+on the current route into a new numbered segment (`mic-002.caf`, …). The
+already-recorded segment is never modified.
+
+What you see while recording:
+
+- feather red, `● recording · 28:11` — both tracks healthy;
+- feather orange, `◐ recovering microphone · 28:11` — a track stalled and is
+  being restarted (up to three attempts);
+- feather orange, `⚠ microphone capture lost · 28:14` — recovery failed; you
+  get one notification, and the session will be marked incomplete;
+- `△ system audio silent` — secondary diagnostic: the system track is running
+  but delivering exact digital silence (may be legitimate — nothing playing).
+
+At stop you get a notification if the session was anything other than
+`complete`, and the transcript header carries the same status. Transcription
+still runs — every segment that has audio is transcribed and merged on the
+session clock, with the gap left visible in the timestamps.
+
+After an incident, inspect `meta.json` in the session folder: each track lists
+its `segments` (with session-clock start/end offsets and frame counts) and
+`interruptions` (when the stall was detected, when capture resumed, how many
+attempts it took). `status` tells you whether the track is `complete`,
+`recovered` (usable, with a bounded gap), or `incomplete` (audio missing at
+the tail or an unrecovered stall).
 
 ## Transcription
 

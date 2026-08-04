@@ -198,6 +198,11 @@ pub struct RecordingSession {
 // start(): system first, then mic; mic failure tears the loopback down so a
 // half-silent session never runs. stop(): stop both, write meta.json.
 
+// NOTE: the shared contract is now metadata schema v2 (docs/architecture.md
+// §Session metadata v2): tracks[].segments[] with per-segment offsets,
+// interruptions, and a complete/recovered/incomplete status. The full Windows
+// application targets v2; the v1 struct below is retained only as the probe's
+// historical shape. Readers must accept both.
 #[derive(Serialize)]
 pub struct SessionMeta {
     started: String,             // ISO 8601

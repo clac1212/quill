@@ -7,8 +7,16 @@ import Foundation
 /// process's output to stereo and hands us buffers through a private aggregate
 /// device. First use triggers the one-time "System Audio Recording" TCC prompt
 /// and lights the purple recording indicator while active.
-final class SystemAudioRecorder {
+///
+/// One start/stop pair is one segment and one complete process-tap/
+/// aggregate-device/IO-proc lifecycle; recovery destroys the old resources and
+/// constructs fresh ones for the next numbered file. Default-output and
+/// device-list changes are reported as suspect events; exact-zero buffers keep
+/// the transport heartbeat healthy (legitimate silence is possible) and only
+/// feed the silence diagnostic.
+final class SystemAudioRecorder: TrackRecorder, @unchecked Sendable {
     enum RecorderError: Error, CustomStringConvertible {
+        case alreadyRecording
         case tapCreationFailed(OSStatus)
         case tapFormatUnreadable(OSStatus)
         case aggregateCreationFailed(OSStatus)
@@ -18,6 +26,7 @@ final class SystemAudioRecorder {
 
         var description: String {
             switch self {
+            case .alreadyRecording: return "system segment already active"
             case .tapCreationFailed(let s):
                 return "process tap creation failed (OSStatus \(s)) — check System Settings → Privacy & Security → Screen & System Audio Recording"
             case .tapFormatUnreadable(let s): return "couldn't read tap stream format (OSStatus \(s))"
@@ -29,56 +38,145 @@ final class SystemAudioRecorder {
         }
     }
 
+    let kind = TrackKind.system
+
+    private let control = DispatchQueue(label: "com.digimata.quill.system-control")
+    private let ioQueue = DispatchQueue(label: "com.digimata.quill.system-tap")
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
-    private var file: AVAudioFile?
-    private let queue = DispatchQueue(label: "com.digimata.quill.system-tap")
-    private(set) var isRecording = false
-    /// Wall-clock time of the first captured buffer — the track's true start,
-    /// used to offset-align the two tracks' transcript timestamps.
-    private(set) var firstBufferAt: Date?
+    private var segment: SegmentFile?
+    private var routeListener: AudioObjectPropertyListenerBlock?
+    private var lastStats: SegmentStats?
 
-    /// Start capturing system audio, encoding AAC into `url` (use a .caf
-    /// extension — CAF needs no finalization pass, so a crash mid-meeting
-    /// loses nothing already written).
-    func start(writingTo url: URL) throws {
-        guard !isRecording else { return }
+    private static let routeProperties: [AudioObjectPropertySelector] = [
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioHardwarePropertyDevices,
+    ]
 
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
-        description.name = "quill system tap"
-        description.isPrivate = true
-        description.muteBehavior = .unmuted
+    /// Start a new segment: create the tap, aggregate device, file, and IO
+    /// proc, then attach route observers. Throws if a segment is active.
+    func start(url: URL, clock: SessionClock, onEvent: @escaping @Sendable (RecorderEvent) -> Void) throws {
+        try control.sync {
+            guard tapID == kAudioObjectUnknown else { throw RecorderError.alreadyRecording }
 
-        var newTapID = AudioObjectID(kAudioObjectUnknown)
-        let status = AudioHardwareCreateProcessTap(description, &newTapID)
-        guard status == noErr else { throw RecorderError.tapCreationFailed(status) }
-        tapID = newTapID
+            let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+            description.name = "quill system tap"
+            description.isPrivate = true
+            description.muteBehavior = .unmuted
 
-        do {
-            let format = try tapStreamFormat()
-            try createAggregateDevice(tapUUID: description.uuid)
-            file = try makeFile(url: url, format: format)
-            try installIOProc(format: format)
-        } catch {
-            cleanup()
-            throw error
+            var newTapID = AudioObjectID(kAudioObjectUnknown)
+            let status = AudioHardwareCreateProcessTap(description, &newTapID)
+            guard status == noErr else { throw RecorderError.tapCreationFailed(status) }
+            tapID = newTapID
+
+            // Any failure past this point releases exactly the resources this
+            // attempt created, so a failed recovery never leaks a tap.
+            do {
+                let format = try tapStreamFormat()
+                try createAggregateDevice(tapUUID: description.uuid)
+                let file = try makeFile(url: url, format: format)
+                segment = SegmentFile(
+                    file: file,
+                    fileName: url.lastPathComponent,
+                    sampleRateHz: Int(format.sampleRate),
+                    channels: Int(format.channelCount),
+                    clock: clock
+                )
+                try installIOProc(format: format, onEvent: onEvent)
+            } catch {
+                cleanupLocked()
+                throw error
+            }
+
+            observeRoute(onEvent: onEvent)
+            FileHandle.standardError.write(
+                Data(
+                    "system: segment=\(url.lastPathComponent)\n".utf8
+                ))
         }
-
-        isRecording = true
     }
 
-    /// Stop capturing and finalize the file. Idempotent.
-    func stop() {
-        guard isRecording else { return }
-        isRecording = false
-        if let procID, aggregateID != kAudioObjectUnknown {
-            AudioDeviceStop(aggregateID, procID)
+    /// Stop the active segment and return its stats. Bounded: if Core Audio
+    /// teardown wedges, gives up after 5 s rather than hanging the caller.
+    func stop() -> SegmentStats? {
+        let done = DispatchSemaphore(value: 0)
+        control.async {
+            self.lastStats = self.teardownLocked()
+            done.signal()
         }
-        cleanup()
+        if done.wait(timeout: .now() + 5) == .timedOut {
+            FileHandle.standardError.write(Data("system teardown timed out\n".utf8))
+            return nil
+        }
+        return lastStats
+    }
+
+    func telemetry() -> TelemetrySnapshot {
+        segment?.telemetry.snapshot() ?? TelemetrySnapshot()
     }
 
     // MARK: -
+
+    /// Watch the system default output and the device list. Either changing
+    /// marks the track suspect; the property-listener callback never touches
+    /// the tap directly — the session decides on its own queue.
+    private func observeRoute(onEvent: @escaping @Sendable (RecorderEvent) -> Void) {
+        let listener: AudioObjectPropertyListenerBlock = { _, _ in
+            onEvent(.routeChanged)
+        }
+        for selector in Self.routeProperties {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let status = AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, control, listener
+            )
+            if status != noErr {
+                FileHandle.standardError.write(
+                    Data(
+                        "warning: system route listener failed (OSStatus \(status))\n".utf8
+                    ))
+            }
+        }
+        routeListener = listener
+    }
+
+    private func removeRouteListener() {
+        guard let routeListener else { return }
+        for selector in Self.routeProperties {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, control, routeListener
+            )
+        }
+        self.routeListener = nil
+    }
+
+    /// Ordered teardown on the control queue: stop the device, remove
+    /// observers, destroy the IO proc/aggregate/tap, close the file.
+    private func teardownLocked() -> SegmentStats? {
+        guard tapID != kAudioObjectUnknown || segment != nil else { return nil }
+        if let procID, aggregateID != kAudioObjectUnknown {
+            AudioDeviceStop(aggregateID, procID)
+        }
+        removeRouteListener()
+        let stats: SegmentStats?
+        if let segment {
+            _ = segment.finish()
+            stats = segment.stats()
+        } else {
+            stats = nil
+        }
+        cleanupLocked()
+        return stats
+    }
 
     private func tapStreamFormat() throws -> AVAudioFormat {
         var address = AudioObjectPropertyAddress(
@@ -134,20 +232,24 @@ final class SystemAudioRecorder {
         }
     }
 
-    private func installIOProc(format: AVAudioFormat) throws {
-        var status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) {
-            [weak self] _, inInputData, _, _, _ in
-            guard let self, let file = self.file else { return }
-            if self.firstBufferAt == nil { self.firstBufferAt = Date() }
-            guard let buffer = AVAudioPCMBuffer(
-                pcmFormat: format,
-                bufferListNoCopy: inInputData,
-                deallocator: nil
-            ) else { return }
-            do {
-                try file.write(from: buffer)
-            } catch {
-                FileHandle.standardError.write(Data("system track write failed: \(error)\n".utf8))
+    private func installIOProc(
+        format: AVAudioFormat,
+        onEvent: @escaping @Sendable (RecorderEvent) -> Void
+    ) throws {
+        guard let segment else { throw RecorderError.ioProcCreationFailed(-1) }
+        var status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, ioQueue) {
+            _, inInputData, inInputTime, _, _ in
+            guard
+                let buffer = AVAudioPCMBuffer(
+                    pcmFormat: format,
+                    bufferListNoCopy: inInputData,
+                    deallocator: nil
+                )
+            else { return }
+            let stamp = inInputTime.pointee
+            let hostTime = stamp.mFlags.contains(.hostTimeValid) ? stamp.mHostTime : nil
+            if let error = segment.write(buffer, hostTime: hostTime) {
+                onEvent(.writeFailed(error))
             }
         }
         guard status == noErr, let procID else { throw RecorderError.ioProcCreationFailed(status) }
@@ -156,7 +258,9 @@ final class SystemAudioRecorder {
         guard status == noErr else { throw RecorderError.deviceStartFailed(status) }
     }
 
-    private func cleanup() {
+    /// Release whatever this attempt created, in dependency order. Safe after
+    /// partial construction.
+    private func cleanupLocked() {
         if let procID, aggregateID != kAudioObjectUnknown {
             AudioDeviceDestroyIOProcID(aggregateID, procID)
         }
@@ -169,6 +273,6 @@ final class SystemAudioRecorder {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
-        file = nil
+        segment = nil
     }
 }
