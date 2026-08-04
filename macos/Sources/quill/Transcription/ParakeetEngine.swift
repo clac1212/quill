@@ -77,11 +77,12 @@ actor ParakeetEngine: TranscriptionEngine {
 
         func flush() {
             guard let first = current.first, let last = current.last else { return }
-            out.append(TranscriptSegment(
-                start: first.startTime,
-                end: last.endTime,
-                text: current.map(\.word).joined(separator: " ")
-            ))
+            out.append(
+                TranscriptSegment(
+                    start: first.startTime,
+                    end: last.endTime,
+                    text: current.map(\.word).joined(separator: " ")
+                ))
             current = []
         }
 
@@ -90,7 +91,8 @@ actor ParakeetEngine: TranscriptionEngine {
                 flush()
             }
             current.append(word)
-            let endsSentence = word.word.hasSuffix(".")
+            let endsSentence =
+                word.word.hasSuffix(".")
                 || word.word.hasSuffix("?")
                 || word.word.hasSuffix("!")
             if endsSentence || current.count >= 60 {

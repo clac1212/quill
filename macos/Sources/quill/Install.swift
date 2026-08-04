@@ -19,9 +19,10 @@ struct Install: ParsableCommand {
 
     func run() throws {
         if launchAtLogin == uninstall {
-            FileHandle.standardError.write(Data(
-                "specify exactly one of --launch-at-login or --uninstall\n".utf8
-            ))
+            FileHandle.standardError.write(
+                Data(
+                    "specify exactly one of --launch-at-login or --uninstall\n".utf8
+                ))
             throw ExitCode(64)
         }
 
@@ -38,7 +39,8 @@ struct Install: ParsableCommand {
 
     private var plistURL: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return home
+        return
+            home
             .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
             .appendingPathComponent("\(Self.label).plist")
     }
@@ -72,9 +74,10 @@ struct Install: ParsableCommand {
         _ = runLaunchctl(["bootout", "gui/\(uid())", url.path])
         let result = runLaunchctl(["bootstrap", "gui/\(uid())", url.path])
         if result.status != 0 {
-            FileHandle.standardError.write(Data(
-                "warning: launchctl bootstrap exited \(result.status):\n\(result.stderr)\n".utf8
-            ))
+            FileHandle.standardError.write(
+                Data(
+                    "warning: launchctl bootstrap exited \(result.status):\n\(result.stderr)\n".utf8
+                ))
         }
 
         print("✓ launch-at-login installed")
@@ -104,14 +107,16 @@ struct Install: ParsableCommand {
         // Fall back to the running executable's resolved path.
         let argv0 = CommandLine.arguments.first ?? "quill"
         if argv0.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: argv0) {
-            FileHandle.standardError.write(Data(
-                "note: /usr/local/bin/quill not found; using \(argv0)\n".utf8
-            ))
+            FileHandle.standardError.write(
+                Data(
+                    "note: /usr/local/bin/quill not found; using \(argv0)\n".utf8
+                ))
             return argv0
         }
-        FileHandle.standardError.write(Data(
-            "couldn't locate the quill binary. install it to /usr/local/bin/quill first.\n".utf8
-        ))
+        FileHandle.standardError.write(
+            Data(
+                "couldn't locate the quill binary. install it to /usr/local/bin/quill first.\n".utf8
+            ))
         throw ExitCode(1)
     }
 
@@ -130,10 +135,11 @@ struct Install: ParsableCommand {
             return (-1, "\(error)")
         }
         task.waitUntilExit()
-        let err = String(
-            data: errPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
+        let err =
+            String(
+                data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
         return (task.terminationStatus, err)
     }
 }

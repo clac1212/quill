@@ -4,7 +4,8 @@ import Foundation
 /// UserNotifications entitlement requirements (which need an app bundle).
 func notifyUser(title: String, body: String) {
     func quoted(_ s: String) -> String {
-        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\")
+        "\""
+            + s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
     let script = "display notification \(quoted(body)) with title \(quoted(title))"

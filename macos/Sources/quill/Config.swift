@@ -66,9 +66,10 @@ enum Config {
             let data = try? Data(contentsOf: path),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            FileHandle.standardError.write(Data(
-                "warning: \(path.path) is not valid JSON — ignoring config\n".utf8
-            ))
+            FileHandle.standardError.write(
+                Data(
+                    "warning: \(path.path) is not valid JSON — ignoring config\n".utf8
+                ))
             return nil
         }
         return json
