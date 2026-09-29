@@ -2,6 +2,8 @@
 
 # quill
 
+> **Fork de [humanitas-labs/quill](https://github.com/humanitas-labs/quill)** — transcription multilingue (dont le français) : modèle Parakeet Ultra au lieu de Parakeet v2 (anglais seul), FluidAudio 0.17.4. Modifs sur la branche `fr-ultra`, rebasée sur `upstream/main`.
+
 A fully local meeting recorder and transcriber. Quill records your mic and the call's audio as separate tracks, transcribes them on-device, and writes a timestamped `me` / `them` transcript. Nothing leaves the machine.
 
 ## 1. Install
