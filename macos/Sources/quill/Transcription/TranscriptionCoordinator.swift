@@ -17,6 +17,7 @@ actor TranscriptionCoordinator {
     private var queue: [URL] = []
     private var draining = false
     private var engine: TranscriptionEngine?
+    private var voiceAnalyzer: VoiceAnalyzer?
     private var lastFailure: String?
     private var statusHandler: (@Sendable (Status) -> Void)?
 
@@ -80,8 +81,12 @@ actor TranscriptionCoordinator {
             let dir = queue.removeFirst()
             publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
             do {
-                try await transcribe(dir)
-                notifyUser(title: "quill — transcript ready", body: dir.lastPathComponent)
+                let unnamed = try await transcribe(dir)
+                notifyUser(
+                    title: "quill — transcript ready",
+                    body: dir.lastPathComponent
+                        + (unnamed > 0 ? " · \(unnamed) voice(s) to name from the menu" : "")
+                )
                 runHook(for: dir)
             } catch {
                 log(dir, "transcription failed: \(error)")
@@ -94,6 +99,8 @@ actor TranscriptionCoordinator {
         }
         await engine?.release()
         engine = nil
+        await voiceAnalyzer?.release()
+        voiceAnalyzer = nil
         publish(lastFailure.map { .failed(session: $0) } ?? .idle)
         draining = false
         // An enqueue that landed between the loop exiting and the release
@@ -101,15 +108,19 @@ actor TranscriptionCoordinator {
         drainIfIdle()
     }
 
-    private func transcribe(_ dir: URL) async throws {
+    /// Returns how many of the session's voices are still unnamed.
+    private func transcribe(_ dir: URL) async throws -> Int {
         // Both metadata schemas normalize to ordered (file, speaker, offset)
         // inputs — one per segment under v2, one per track under v1. Each
         // segment transcribes independently and shifts onto the session
         // clock, so timing gaps around a capture recovery stay visible.
         let (inputs, captureStatus) = try SessionMeta.readInputs(from: dir)
         let engine = try await preparedEngine()
+        let directory = Config.voicesEnabled() ? loadVoiceDirectory(for: dir) : nil
+        var voices = SessionVoices()
 
-        var merged: [Transcript.Segment] = []
+        // First pass: words, and voices when enabled, for every segment file.
+        var tracks: [(input: SessionMeta.TrackInput, words: [TimedWord], analysis: VoiceAnalyzer.Analysis?)] = []
         for input in inputs {
             let audio = dir.appendingPathComponent(input.file)
             guard FileManager.default.fileExists(atPath: audio.path) else {
@@ -119,25 +130,88 @@ actor TranscriptionCoordinator {
             log(dir, "transcribing \(input.file) (\(engine.name))")
             // One bad segment (empty, truncated) shouldn't cost us the rest —
             // log it and keep going.
-            let segments: [TranscriptSegment]
+            let words: [TimedWord]
             do {
-                segments = try await engine.transcribe(audio)
+                words = try await engine.transcribe(audio)
             } catch {
                 log(dir, "skipping \(input.file): \(error)")
                 continue
             }
-            merged += Transcript.shifted(segments, speaker: input.speaker, offsetMs: input.offsetMs)
+            let analysis = directory == nil ? nil : await analyzeVoices(audio, file: input.file, dir: dir)
+            tracks.append((input, words, analysis))
+        }
+
+        // Call audio leaking into the mic shows up as extra mic voices that
+        // only speak while the other side does; they stay plain "me".
+        let remoteSpeech = tracks.filter { $0.input.speaker == TrackKind.system.speaker }
+            .flatMap { track in
+                (track.analysis?.spans ?? []).map { span in
+                    let offset = TimeInterval(track.input.offsetMs) / 1000
+                    return (start: span.start + offset, end: span.end + offset)
+                }
+            }
+
+        var merged: [Transcript.Segment] = []
+        for track in tracks {
+            var wordVoices: [Int?]?
+            if let directory, let analysis = track.analysis {
+                let echoes =
+                    track.input.speaker == TrackKind.mic.speaker
+                    ? VoiceSpan.echoSpeakers(
+                        in: analysis.spans, offset: TimeInterval(track.input.offsetMs) / 1000,
+                        remoteSpeech: remoteSpeech)
+                    : []
+                let kept = analysis.speakers.filter { !echoes.contains($0.index) }
+                let ids = voices.assign(kept, file: track.input.file, directory: directory)
+                log(dir, "\(track.input.file): \(kept.count) voices" + (echoes.isEmpty ? "" : ", \(echoes.count) echo"))
+                wordVoices = VoiceSpan.speakers(of: track.words, in: analysis.spans).map { $0.flatMap { ids[$0] } }
+            }
+            let segments = TranscriptSegment.grouped(track.words, voices: wordVoices)
+            merged += Transcript.shifted(segments, speaker: track.input.speaker, offsetMs: track.input.offsetMs)
         }
         merged.sort { $0.start_ms < $1.start_ms }
 
-        let transcript = Transcript(
+        var transcript = Transcript(
             engine: engine.name,
             model: engine.model,
             created_at: ISO8601DateFormatter().string(from: Date()),
             segments: merged
         )
+        transcript.applyNames(voices)
         try transcript.write(to: dir, captureStatus: captureStatus)
-        log(dir, "done — \(merged.count) segments")
+        // After transcript.json: its presence marks the session done, and the
+        // naming window only lists sessions that have both files.
+        if !voices.voices.isEmpty { try voices.write(to: dir) }
+        log(dir, "done — \(merged.count) segments, \(voices.voices.count) voices")
+        return voices.unnamedCount
+    }
+
+    /// Voice identification is best-effort: a failure (model download while
+    /// offline, for instance) leaves the track as plain "me"/"them".
+    private func analyzeVoices(_ audio: URL, file: String, dir: URL) async -> VoiceAnalyzer.Analysis? {
+        do {
+            return try await preparedVoiceAnalyzer().analyze(audio)
+        } catch {
+            log(dir, "voice identification skipped for \(file): \(error)")
+            return nil
+        }
+    }
+
+    private func loadVoiceDirectory(for dir: URL) -> VoiceDirectory? {
+        do {
+            return try VoiceDirectory.load(root: dir.deletingLastPathComponent())
+        } catch {
+            log(dir, "voice identification skipped — unreadable voice directory: \(error)")
+            return nil
+        }
+    }
+
+    private func preparedVoiceAnalyzer() async throws -> VoiceAnalyzer {
+        if let voiceAnalyzer { return voiceAnalyzer }
+        let analyzer = VoiceAnalyzer()
+        try await analyzer.prepare()
+        voiceAnalyzer = analyzer
+        return analyzer
     }
 
     private func preparedEngine() async throws -> TranscriptionEngine {
@@ -191,17 +265,28 @@ actor TranscriptionCoordinator {
 /// exists to be serialized. Internal (not private) so the offset-preserving
 /// merge math is unit-testable.
 struct Transcript: Codable {
+    /// `voice_id` points into the session's voices.json and `voice` is that
+    /// voice's name once known; both are absent when voice identification
+    /// didn't run, so `speaker` keeps its me/them meaning either way.
     struct Segment: Codable, Equatable {
         let speaker: String
         let start_ms: Int
         let end_ms: Int
         let text: String
+        var voice_id: Int? = nil
+        var voice: String? = nil
+
+        /// Who the readable transcript shows: the name, else a numbered
+        /// "voice 2" so unnamed voices stay distinguishable.
+        var displayName: String {
+            voice ?? voice_id.map { "voice \($0)" } ?? speaker
+        }
     }
 
     let engine: String
     let model: String
     let created_at: String
-    let segments: [Segment]
+    var segments: [Segment]
 
     /// Shift one audio file's transcript segments onto the session clock by
     /// the file's start offset. Segments are never collapsed against a
@@ -214,9 +299,23 @@ struct Transcript: Codable {
                 speaker: speaker,
                 start_ms: Int($0.start * 1000) + offsetMs,
                 end_ms: Int($0.end * 1000) + offsetMs,
-                text: $0.text
+                text: $0.text,
+                voice_id: $0.voiceId
             )
         }
+    }
+
+    /// Set every segment's `voice` from the session's current voice names.
+    mutating func applyNames(_ voices: SessionVoices) {
+        let names = Dictionary(uniqueKeysWithValues: voices.voices.map { ($0.id, $0.name) })
+        for i in segments.indices {
+            segments[i].voice = segments[i].voice_id.flatMap { names[$0] ?? nil }
+        }
+    }
+
+    static func read(from dir: URL) throws -> Transcript {
+        try JSONDecoder().decode(
+            Transcript.self, from: Data(contentsOf: dir.appendingPathComponent("transcript.json")))
     }
 
     /// Write transcript.json and render transcript.md. Both writes are atomic
@@ -241,7 +340,7 @@ struct Transcript: Codable {
         }
         lines.append("")
         for seg in segments {
-            lines.append("**[\(Self.clock(seg.start_ms))] \(seg.speaker):** \(seg.text)")
+            lines.append("**[\(Self.clock(seg.start_ms))] \(seg.displayName):** \(seg.text)")
             lines.append("")
         }
         return lines.joined(separator: "\n")

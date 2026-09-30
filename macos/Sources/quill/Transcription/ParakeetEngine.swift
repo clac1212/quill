@@ -34,7 +34,7 @@ actor ParakeetEngine: TranscriptionEngine {
         self.manager = manager
     }
 
-    func transcribe(_ audio: URL) async throws -> [TranscriptSegment] {
+    func transcribe(_ audio: URL) async throws -> [TimedWord] {
         guard let manager else { throw EngineError.notPrepared }
 
         // A track with no frames (recorder died before its first buffer)
@@ -55,51 +55,15 @@ actor ParakeetEngine: TranscriptionEngine {
 
         let words = buildWordTimings(from: result.tokenTimings ?? [])
         guard !words.isEmpty else {
+            // No token timings: the whole utterance becomes one timed "word".
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return text.isEmpty
-                ? []
-                : [TranscriptSegment(start: 0, end: result.duration, text: text)]
+            return text.isEmpty ? [] : [TimedWord(start: 0, end: result.duration, text: text)]
         }
-        return Self.segments(from: words)
+        return words.map { TimedWord(start: $0.startTime, end: $0.endTime, text: $0.word) }
     }
 
     func release() async {
         if let manager { await manager.cleanup() }
         manager = nil
-    }
-
-    /// Group word timings into readable segments: break on sentence-ending
-    /// punctuation (parakeet ultra emits punctuation), a silence gap, or a hard
-    /// length cap so a run-on speaker still wraps.
-    private static func segments(from words: [WordTiming]) -> [TranscriptSegment] {
-        var out: [TranscriptSegment] = []
-        var current: [WordTiming] = []
-
-        func flush() {
-            guard let first = current.first, let last = current.last else { return }
-            out.append(
-                TranscriptSegment(
-                    start: first.startTime,
-                    end: last.endTime,
-                    text: current.map(\.word).joined(separator: " ")
-                ))
-            current = []
-        }
-
-        for word in words {
-            if let last = current.last, word.startTime - last.endTime > 1.0 {
-                flush()
-            }
-            current.append(word)
-            let endsSentence =
-                word.word.hasSuffix(".")
-                || word.word.hasSuffix("?")
-                || word.word.hasSuffix("!")
-            if endsSentence || current.count >= 60 {
-                flush()
-            }
-        }
-        flush()
-        return out
     }
 }

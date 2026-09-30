@@ -4,7 +4,7 @@ import Foundation
 ///
 ///     {
 ///       "recordings_dir": "~/Recordings",
-///       "transcription": { "enabled": true, "engine": "parakeet" },
+///       "transcription": { "enabled": true, "engine": "parakeet", "voices": true },
 ///       "mic_voice_processing": true,
 ///       "on_stop": "my-hook"
 ///     }
@@ -42,6 +42,12 @@ enum Config {
     /// warns and falls back for anything else.
     static func transcriptionEngine() -> String {
         transcription()?["engine"] as? String ?? "parakeet"
+    }
+
+    /// Whether the system track is split into voices and matched against the
+    /// voices named from the menu. Default on.
+    static func voicesEnabled() -> Bool {
+        transcription()?["voices"] as? Bool ?? true
     }
 
     private static func transcription() -> [String: Any]? {
