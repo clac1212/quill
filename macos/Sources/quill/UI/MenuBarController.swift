@@ -21,10 +21,15 @@ final class MenuBarController {
     private let warningLabel: NSMenuItem
     private let transcriptionLabel: NSMenuItem
     private let toggleItem: NSMenuItem
+    private let voicesItem: NSMenuItem
+    private let menuObserver = MenuObserver()
 
     var onToggle: (() -> Void)?
     var onOpenFolder: (() -> Void)?
+    var onNameVoices: (() -> Void)?
     var onQuit: (() -> Void)?
+    /// Unnamed voices across sessions, recounted each time the menu opens.
+    var unnamedVoiceCount: (() -> Int)?
 
     init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -62,6 +67,13 @@ final class MenuBarController {
         )
         menu.addItem(openFolder)
 
+        voicesItem = NSMenuItem(
+            title: "Name voices…",
+            action: #selector(nameVoicesClicked),
+            keyEquivalent: "n"
+        )
+        menu.addItem(voicesItem)
+
         menu.addItem(.separator())
 
         let quit = NSMenuItem(
@@ -71,11 +83,13 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [toggleItem, openFolder, quit] {
+        for item in [toggleItem, openFolder, voicesItem, quit] {
             item.target = self
         }
 
+        menu.delegate = menuObserver
         statusItem.menu = menu
+        menuObserver.onOpen = { [weak self] in self?.refreshVoicesItem() }
 
         if let button = statusItem.button {
             let image = Self.featherImage()
@@ -146,7 +160,21 @@ final class MenuBarController {
         return image
     }
 
+    private func refreshVoicesItem() {
+        let count = unnamedVoiceCount?() ?? 0
+        voicesItem.title = count > 0 ? "Name voices (\(count) unnamed)…" : "Name voices…"
+    }
+
     @objc private func toggleClicked() { onToggle?() }
     @objc private func openFolderClicked() { onOpenFolder?() }
+    @objc private func nameVoicesClicked() { onNameVoices?() }
     @objc private func quitClicked() { onQuit?() }
+}
+
+/// NSMenuDelegate needs an NSObject; MenuBarController isn't one.
+@MainActor
+private final class MenuObserver: NSObject, NSMenuDelegate {
+    var onOpen: (() -> Void)?
+
+    func menuWillOpen(_ menu: NSMenu) { onOpen?() }
 }

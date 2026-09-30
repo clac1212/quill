@@ -14,6 +14,7 @@ let package = Package(
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                "QuillUI",
             ],
             exclude: ["Info.plist"],
             linkerSettings: [
@@ -28,9 +29,11 @@ let package = Package(
                 ]),
             ]
         ),
+        // SwiftUI views, kept out of the executable so Xcode can preview them.
+        .target(name: "QuillUI"),
         .testTarget(
             name: "QuillTests",
-            dependencies: ["quill"]
+            dependencies: ["quill", "QuillUI"]
         ),
     ]
 )

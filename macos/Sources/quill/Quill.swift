@@ -82,14 +82,18 @@ final class AppController {
     private let root: URL
     private let menuBar = MenuBarController()
     private let transcription = TranscriptionCoordinator()
+    private let voicesWindow: VoicesWindowController
     private var session: RecordingSession?
     private var captureStatus = RecordingSession.CaptureStatus.allHealthy
     private var ticker: Timer?
 
     init(root: URL) {
         self.root = root
+        voicesWindow = VoicesWindowController(root: root)
         menuBar.onToggle = { [weak self] in self?.toggle() }
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
+        menuBar.onNameVoices = { [weak self] in self?.voicesWindow.show() }
+        menuBar.unnamedVoiceCount = { VoiceLibrary.unnamedCount(root: root) }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
         menuBar.update(.idle)
 

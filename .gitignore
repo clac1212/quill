@@ -10,3 +10,6 @@ obj/
 
 # local planning notes
 .plan/
+
+# Xcode local state (opening macos/Package.swift)
+.swiftpm/
