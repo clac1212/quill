@@ -49,6 +49,7 @@ Each session lands in `~/Recordings/<yyyy.MM.dd-HHmm>/`:
 | `meta.json` | start/end timestamps, duration, per-track segments/offsets, and capture status (`complete`/`recovered`/`incomplete`) |
 | `transcript.json` | canonical transcript — engine provenance + timed, speaker-tagged segments |
 | `transcript.md` | the same transcript rendered for reading |
+| `voices.json` | the voices found on the system track, their names, and an excerpt to play (see [Voices](#voices)) |
 | `transcribe.log` | transcription progress/errors for this session |
 
 Two tracks on purpose: speech models do better on clean single-source audio,
@@ -107,6 +108,35 @@ on next launch (the filesystem is the queue: a session with `meta.json` but no
 The engine sits behind a small protocol; a Whisper engine (WhisperKit
 large-v3-turbo) is planned as the fallback / re-transcription option.
 
+## Voices
+
+`them` is everyone on the other side of the call, and `me` is everyone in the
+room. To tell people apart, each track is split into voices with **Nemotron 3
+Diarization** (NVIDIA, up to 8 speakers, offline preset) and each voice gets a
+**WeSpeaker** embedding — both via FluidAudio, on-device, a few seconds per
+hour of audio. On the mic track, a "voice" that only speaks while the other
+side does is call audio leaking into the mic, not a person: it stays `me`.
+
+- A new voice shows up as `voice 1`, `voice 2`… in `transcript.md`. Name your
+  own voice once, and the rest of the room becomes the voices left to name.
+- **Name voices…** in the menu opens a small window: pick a session, play each
+  voice's excerpt, type a name (or pick a known one). **Ignore** stops asking
+  about a voice (a one-off guest, crosstalk).
+- A name is remembered in `<recordings root>/.voices/voices.json` and applied
+  wherever the same voice is still unnamed — past sessions right away, future
+  sessions at transcription. Each meeting needs fewer names than the last.
+
+In `transcript.json`, voice-tagged segments carry `voice_id` (into the
+session's `voices.json`) and `voice` (the name, once known); `speaker` keeps
+its `me`/`them` meaning. Two embeddings count as the same person above a
+cosine similarity of 0.6 — on real French meetings the same person scored
+0.80–0.94 across meetings and different people at most 0.45.
+
+Voice identification is best-effort: if it fails (models not downloadable
+offline, for instance) the track is transcribed as plain `them` and the reason
+lands in `transcribe.log`. The directory stores voice embeddings of the people
+you name — biometric data; it never leaves the machine.
+
 ## Config
 
 Optional, at `~/.config/quill/config.json`:
@@ -114,7 +144,7 @@ Optional, at `~/.config/quill/config.json`:
 ```json
 {
   "recordings_dir": "~/Recordings",
-  "transcription": { "enabled": true, "engine": "parakeet" },
+  "transcription": { "enabled": true, "engine": "parakeet", "voices": true },
   "on_stop": "my-hook"
 }
 ```
@@ -122,6 +152,8 @@ Optional, at `~/.config/quill/config.json`:
 - `recordings_dir` — where sessions land. Resolution order: `--out` flag >
   config > `~/Recordings`.
 - `transcription.enabled` — set `false` to just record.
+- `transcription.voices` — set `false` to keep the system track as a single
+  `them` (see [Voices](#voices)).
 - `mic_voice_processing` — Apple's echo cancellation on the mic (default off).
   Set `true` when recording meetings through the speakers, so playback doesn't
   bleed into the mic track and get transcribed twice as "me". The trade: while
@@ -151,7 +183,8 @@ quill install --uninstall
 - **AVAudioEngine** — mic capture
 - **AVAudioFile** — streaming AAC encode into CAF
 - **FluidAudio / Parakeet** — on-device Core ML transcription
-- **NSStatusItem** — the whole UI
+- **FluidAudio / Nemotron 3 Diarization + WeSpeaker** — voices on the system track
+- **NSStatusItem** — the menu; one small SwiftUI window to name voices
 
 ## Gotchas
 

@@ -1,6 +1,6 @@
 # Quill architecture
 
-Last updated: `2026.08.04`
+Last updated: `2026.09.30`
 
 Quill is one product with separate native implementations for each supported
 desktop platform. Platform code does not share a runtime or source language.
@@ -14,7 +14,8 @@ Quill product
 ├── macOS implementation
 │   ├── Swift and AppKit lifecycle
 │   ├── Core Audio capture
-│   └── Core ML transcription through FluidAudio
+│   ├── Core ML transcription through FluidAudio
+│   └── voice identification (fr-ultra fork, ADR-002)
 ├── Windows implementation
     ├── native Windows lifecycle
     ├── WASAPI microphone and process-loopback capture
@@ -84,6 +85,29 @@ Rules the schema encodes:
   `start_offset_ms`; capture gaps stay visible as timestamp gaps in the merged
   transcript.
 
+### Voices (macOS, fr-ultra fork)
+
+Voice identification ([ADR-002](decisions/002-voice-identification.md)) adds
+to the contract without changing it:
+
+- transcript segments may carry `voice_id` (into the session's
+  `voices.json`) and `voice` (the name once known); `speaker` stays
+  `me`/`them`;
+- `voices.json` per session: `voices[]` with `id`, optional `name`,
+  `ignored`, `embedding`, and a `sample` (`file`, `start_ms`, `end_ms`) to
+  play back;
+- `<recordings root>/.voices/voices.json`: the named people and their
+  embeddings, shared by all sessions.
+
+Pipeline, after both tracks are transcribed word by word: diarize each segment
+file → embed each voice → drop mic voices that are call-audio echo → match
+against the session's voices, then the directory → attribute each word to a
+voice → group words into segments, breaking on voice change. Code:
+`macos/Sources/quill/Transcription/Voices.swift` (pure logic),
+`VoiceAnalyzer.swift` (models), `VoiceLibrary.swift` (naming across
+sessions). The naming window is in the `QuillUI` library target
+(`macos/Sources/QuillUI/`), previewable in Xcode.
+
 Formal JSON schemas and compatibility fixtures will be extracted before the
 Windows capture probe becomes a full application. Until then, the macOS output
 implemented in `macos/Sources/quill/SessionMeta.swift`,
@@ -105,3 +129,4 @@ portable executable.
 | Decision | Status | Summary |
 |---|---|---|
 | [ADR-001](decisions/001-multiplatform-repository.md) | Active | Keep native platform implementations in one repository under symmetric platform roots. |
+| [ADR-002](decisions/002-voice-identification.md) | Active (fork) | Identify voices on-device with Nemotron 3 Diarization + WeSpeaker; names given once apply to every session. |
